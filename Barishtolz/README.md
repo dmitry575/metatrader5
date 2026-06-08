@@ -1,4 +1,4 @@
-# Barishtoltz Channels Deep4
+# Barishtoltz Channels
 
 An MQL5 indicator that automatically draws sliding price channels based on Viktor Barishtoltz's algorithm.
 
