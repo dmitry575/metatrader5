@@ -3,7 +3,7 @@
 //|                                      Uses external indicator        |
 //+------------------------------------------------------------------+
 #property copyright "Barishtoltz EA Deep4"
-#property version   "1.05"
+#property version   "1.16"
 #property description "EA uses Barishtoltz_Channels_Deep4 indicator"
 
 #include <Trade/Trade.mqh>
@@ -25,25 +25,32 @@ datetime    _lastBar  = 0;
 int         _lossStreak = 0;
 datetime    _pauseUntil = 0;
 ulong       _lastTicket = 0;
+datetime    _lastSignalTime = 0;
 int         _indHandle = INVALID_HANDLE;
+
+// channel state tracking
+double      _chB1=0, _chB2=0, _chP1=0, _chP2=0;
+datetime    _chBT1=0, _chBT2=0, _chPT1=0, _chPT2=0;
 
 //+------------------------------------------------------------------+
 int OnInit() {
    _trade.SetExpertMagicNumber(Magic);
    _trade.SetDeviationInPoints(10);
 
-   _indHandle = iCustom(_Symbol, _Period, _indName);
-   if(_indHandle == INVALID_HANDLE) {
-      Print("Indicator ", _indName, " not found. Compile it in MetaEditor first.");
-      return INIT_FAILED;
+   if(ObjectFind(0, _indPrfx + "BL") < 0) {
+      _indHandle = iCustom(_Symbol, _Period, _indName);
+      if(_indHandle == INVALID_HANDLE) {
+         Print("Indicator ", _indName, " not found. Compile in MetaEditor first.");
+         return INIT_FAILED;
+      }
+      if(!ChartIndicatorAdd(0, 0, _indHandle)) {
+         Print("Failed to add indicator to chart");
+         return INIT_FAILED;
+      }
+      if(PrintLog) Print("Indicator loaded: ", _indName);
    }
 
-   if(!ChartIndicatorAdd(0, 0, _indHandle)) {
-      Print("Failed to add indicator to chart");
-      return INIT_FAILED;
-   }
-
-   if(PrintLog) Print("Barishtoltz EA v1.05 loaded, indicator: ", _indName);
+   if(PrintLog) Print("Barishtoltz EA v1.16 loaded");
    return INIT_SUCCEEDED;
 }
 
@@ -64,7 +71,7 @@ void OnTick() {
    }
 
    string pos = PositionSelect(_Symbol) ? "POSITION" : (HasOrder() ? "PENDING" : "flat");
-   Comment("Barishtoltz EA v1.05 | Magic: ", Magic,
+   Comment("Barishtoltz EA v1.16 | Magic: ", Magic,
            "\nState: ", pos,
            "\nLoss streak: ", _lossStreak, "/", MaxLosses,
            "\nPause: ", _pauseUntil > 0 ? "YES" : "no");
@@ -75,17 +82,21 @@ void OnTick() {
    }
 
    datetime barTime = iTime(_Symbol, _Period, 1);
-   if(barTime == _lastBar) return;
-   _lastBar = barTime;
+   if(barTime != _lastBar) {
+      _lastBar = barTime;
+      if(IsNewChannel()) {
+         CancelOrdersOutsideChannel();
+         _lastSignalTime = 0;  // allow new signals on next bar
+      }
+      CheckCloseResult();
+      return;  // skip entry on first tick — wait for indicator update
+   }
 
-   CheckCloseResult();
    CheckEntry();
 }
 
 //+------------------------------------------------------------------+
 void CheckEntry() {
-   if(HasOrder()) return;
-
    double b1, b2, p1, p2;
    datetime bT1, bT2, pT1, pT2;
 
@@ -99,30 +110,50 @@ void CheckEntry() {
    ArraySetAsSeries(r, true);
    if(CopyRates(_Symbol, _Period, 0, 3, r) < 3) return;
 
-   // r[1] = last completed bar
-   datetime bt = r[1].time;
+   if(r[0].time == _lastSignalTime) return;
 
-   double baseAt = b1 + slope * (double)(bt - bT1);
-   double parAt  = p1 + slope * (double)(bt - pT1);
-   double upper  = MathMax(baseAt, parAt);
-   double lower  = MathMin(baseAt, parAt);
-
-   int signal = 0;
-   if(r[1].low <= lower && r[1].close > lower) signal = 1;
-   else if(r[1].high >= upper && r[1].close < upper) signal = -1;
-   else return;
-
-   double lots = CalcLots();
-   if(lots <= 0) return;
+   // channel at current bar
+   double baseNow = b1 + slope * (double)(r[0].time - bT1);
+   double parNow  = p1 + slope * (double)(r[0].time - pT1);
+   double upper   = MathMax(baseNow, parNow);
+   double lower   = MathMin(baseNow, parNow);
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   int signal = 0;
+   bool r1buy = r[1].low <= lower && r[1].close > lower;
+   bool r1sell = r[1].high >= upper && r[1].close < upper;
+   bool r0buy = r[0].low <= lower && ask > lower;
+   bool r0sell = r[0].high >= upper && bid < upper;
+   if(r1buy) signal = 1;
+   else if(r1sell) signal = -1;
+   else if(r0buy) signal = 1;
+   else if(r0sell) signal = -1;
+   else return;
+
+   if(PrintLog) {
+      double d = (upper - lower) / _Point;
+      Print("SIGNAL ", signal==1?"BUY":"SELL",
+            " | lower=", lower, " upper=", upper, " width=", d,
+            " | r[1] L=", r[1].low, " H=", r[1].high, " C=", r[1].close,
+            " | r[0] L=", r[0].low, " H=", r[0].high,
+            " | ask=", ask, " bid=", bid,
+            " | r1 buy=", r1buy, " sell=", r1sell,
+            " | r0 buy=", r0buy, " sell=", r0sell);
+   }
+
+   _lastSignalTime = r[0].time;
+   CancelAllOrders();
+
+   double lots = CalcLots();
+   if(lots <= 0) return;
 
    if(signal == 1) {
       double orderPrice = ask + PendDistPts * _Point;
       double sl = orderPrice - StopLossPts * _Point;
       double tp = upper;
-      if(sl >= orderPrice || tp <= orderPrice) return;
+      if(sl >= orderPrice || tp <= ask) return;
       if(_trade.BuyStop(lots, orderPrice, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "BCh Buy Stop")) {
          _lastTicket = _trade.ResultOrder();
          if(PrintLog) Print("BuyStop placed at ", orderPrice, " SL: ", sl, " TP: ", tp);
@@ -131,10 +162,68 @@ void CheckEntry() {
       double orderPrice = bid - PendDistPts * _Point;
       double sl = orderPrice + StopLossPts * _Point;
       double tp = lower;
-      if(sl <= orderPrice || tp >= orderPrice) return;
+      if(sl <= orderPrice || tp >= bid) return;
       if(_trade.SellStop(lots, orderPrice, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "BCh Sell Stop")) {
          _lastTicket = _trade.ResultOrder();
          if(PrintLog) Print("SellStop placed at ", orderPrice, " SL: ", sl, " TP: ", tp);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+bool IsNewChannel() {
+   double b1,b2,p1,p2;
+   datetime bt1,bt2,pt1,pt2;
+   if(!GetLine(_indPrfx+"BL", bt1,b1, bt2,b2)) return false;
+   if(!GetLine(_indPrfx+"PL", pt1,p1, pt2,p2)) return false;
+
+   if(b1==_chB1 && b2==_chB2 && p1==_chP1 && p2==_chP2 &&
+      bt1==_chBT1 && bt2==_chBT2 && pt1==_chPT1 && pt2==_chPT2)
+      return false;
+
+   _chB1=b1; _chB2=b2; _chP1=p1; _chP2=p2;
+   _chBT1=bt1; _chBT2=bt2; _chPT1=pt1; _chPT2=pt2;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void CancelAllOrders() {
+   for(int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0 &&
+         OrderGetInteger(ORDER_MAGIC) == Magic &&
+         OrderGetString(ORDER_SYMBOL) == _Symbol) {
+         _trade.OrderDelete(ticket);
+         if(PrintLog) Print("Cancelled pending order ", ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+void CancelOrdersOutsideChannel() {
+   double b1,b2,p1,p2;
+   datetime bt1,bt2,pt1,pt2;
+   if(!GetLine(_indPrfx+"BL", bt1,b1, bt2,b2)) return;
+   if(!GetLine(_indPrfx+"PL", pt1,p1, pt2,p2)) return;
+   if(bt2 <= bt1) return;
+
+   double slope = (b2 - b1) / (double)(bt2 - bt1);
+   datetime now = TimeCurrent();
+   double baseNow = b1 + slope * (double)(now - bt1);
+   double parNow  = p1 + slope * (double)(now - pt1);
+   double upper = MathMax(baseNow, parNow);
+   double lower = MathMin(baseNow, parNow);
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+
+      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      if(orderPrice < lower || orderPrice > upper) {
+         _trade.OrderDelete(ticket);
+         if(PrintLog) Print("Cancelled order outside channel: ", ticket, " at ", orderPrice);
       }
    }
 }
@@ -202,6 +291,8 @@ void CheckCloseResult() {
       if(ticket == lastCloseTicket) break;
 
       lastCloseTicket = ticket;
+      // prevent re-entry on same bar after position close
+      _lastSignalTime = iTime(_Symbol, _Period, 0);
       double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
 
       if(profit < 0) {
